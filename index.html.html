@@ -1,0 +1,1531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><script type='text/javascript' >
+
+const blockedImages = [];
+const processingImages = {};
+const scoredImages = {};
+const scoreQueue = [];
+const vidMatcher = /google\.com\/search\?.*vid:([^#\&\?]{11})/;
+
+let runningScan = false;
+let processingQueue = false;
+let observer, prevVideo;
+
+// //
+// gather content for flagging
+function gatherContent() {
+  let text = '';
+
+  const title = document.querySelector("meta[property='og:title']");
+  if (title) {
+    text += title.getAttribute('content');
+  }
+
+  const content = document.querySelector("meta[property='og:description']");
+  if (content) {
+    text += ' ' + content.getAttribute('content');
+  }
+
+  return text;
+}
+
+// //
+// add to score queue
+function queueScore(imgId, imgUrl, type) {
+  // Check if already queued
+  const alreadyQueued = scoreQueue.some(item => item.imgId === imgId);
+  if (alreadyQueued) {
+    return;
+  }
+
+  scoreQueue.push({ imgId, imgUrl, type });
+  console.debug('[LS Filter] queued score ->', imgId, imgUrl);
+  
+  // Start processing if not already running
+  if (!processingQueue) {
+    processScoreQueue();
+  }
+}
+
+// //
+// process score queue one at a time
+async function processScoreQueue() {
+  if (processingQueue || scoreQueue.length === 0) {
+    return;
+  }
+
+  processingQueue = true;
+
+  while (scoreQueue.length > 0) {
+    const item = scoreQueue.shift();
+    
+    // Skip if already scored
+    if (scoredImages[item.imgId]) {
+      continue;
+    }
+
+    // Mark as processing
+    processingImages[item.imgId] = {
+      expire: setTimeout(() => {
+        delete processingImages[item.imgId];
+      }, 10000)
+    };
+
+    console.debug('[LS Filter] scoring ->', item.imgId, item.imgUrl);
+
+    // Score the URL and wait for result
+    await new Promise((resolve) => {
+      scoreUrl({ url: item.imgUrl, type: item.type }, (results) => {
+        handleScoredImage(item.imgId, results);
+        resolve();
+      });
+    });
+
+    // Small delay between scores to prevent overwhelming
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  processingQueue = false;
+}
+
+// //
+// apply image score results
+function handleScoredImage(imgId, results) {
+  scoredImages[imgId] = results;
+  const pi = processingImages[imgId];
+  if (pi) {
+    clearTimeout(pi.expire);
+    delete processingImages[imgId];
+  }
+
+  if (results.allow === 'blocked') {
+    // Only add if not already in blockedImages array
+    if (!blockedImages.includes(imgId)) {
+      blockedImages.push(imgId);
+      console.debug('[LS Filter] image blocked ->', imgId);
+      applyImageBlock(imgId);
+    }
+  }
+}
+
+// //
+// apply image block
+function applyImageBlock(id) {
+  const img = document.getElementById(id);
+  if (img && img.src !== blockImg) {
+    img.src = blockImg;
+  }
+}
+
+// //
+// keep image blocked
+function keepBlocked() {
+  blockedImages.forEach((imgId) => {
+    applyImageBlock(imgId);
+  });
+  setTimeout(keepBlocked, 2000);
+}
+
+// //
+// find the nearest node with the attribute
+function findNearest(node, attr) {
+  let i = 0;
+  while (i < 10) {
+    if (node && node.hasAttribute && node.hasAttribute(attr)) {
+      return node;
+    } else if (node && node.parentNode) {
+      node = node.parentNode;
+      i++;
+      continue;
+    }
+    return;
+  }
+}
+
+// //
+// find the next node with the attribute
+function findNext(node, attr) {
+  let i = 0;
+  while (i < 10) {
+    if (node && node.hasAttribute && node.hasAttribute(attr)) {
+      return node;
+    } else if (node && node.firstChild) {
+      node = node.firstChild;
+      i++;
+      continue;
+    }
+    return;
+  }
+}
+
+// //
+// scan images
+function imageScan() {
+  if (runningScan) {
+    return;
+  }
+  runningScan = true;
+
+  // legacy google image search
+  let links = document.getElementsByTagName('a');
+
+  // new google image search
+  if (links.length === 0) {
+    const search = document.getElementById('search');
+    if (search) {
+      links = search.querySelectorAll('g-img');
+    }
+  }
+
+  const imgResRegex = /imgres\?.*imgurl=/;
+  const googleUrlRegex = /google\.com\/url\?/;
+
+  for (let i = 0; i < links.length; i++) {
+    let imgId, imgUrl, el;
+    const imgEl = links[i];
+
+    // legacy google image search
+    if (imgEl.href && (imgResRegex.exec(imgEl.href) || googleUrlRegex.exec(imgEl.href))) {
+      imgUrl = imgEl.href;
+    }
+
+    // new google image search
+    if (!imgUrl) {
+      const dl = findNearest(imgEl, 'data-lpage');
+      if (dl) {
+        imgUrl = dl.getAttribute('data-lpage');
+      }
+    }
+
+    // find the image source
+    if (imgUrl) {
+      const src = findNext(imgEl, 'src');
+      if (src) {
+        el = src;
+      }
+    }
+    
+    // find or make the image id
+    if (!el || !imgUrl || (!imgUrl.startsWith('http://') && !imgUrl.startsWith('https://'))) {
+      continue;
+    }
+
+    // ignore ours
+    if (el.src && el.src.includes(blockImg)) {
+      continue;
+    }
+
+    if (el.id !== '') {
+      imgId = el.id;
+    } else {
+      imgId = Math.random().toString(36).substring(2, 15);
+      el.id = imgId;
+    }
+
+    // processing or scored - skip
+    if (processingImages[imgId] || scoredImages[imgId]) {
+      continue;
+    }
+
+    // Add to queue
+    queueScore(imgId, imgUrl, 'image');
+  }
+  
+  altImageScan();
+  runningScan = false;
+}
+
+// //
+// alternate image scan
+function altImageScan() {
+  document.querySelectorAll('a[data-ved], div[data-ved]').forEach(aEl => {
+    const imgEl = aEl.querySelector('img');
+    if (imgEl && imgEl.src && imgEl.src.startsWith('http') && !imgEl.src.includes(blockImg)) {
+      console.debug('[LS Filter] found alt google image src ->', imgEl.src);
+      
+      // Get the image URL from the anchor's href
+      let imgUrl = aEl.href;
+      if (!imgUrl || (!imgUrl.startsWith('http://') && !imgUrl.startsWith('https://'))) {
+        return;
+      }
+
+      // Create or get image ID
+      let imgId;
+      if (imgEl.id !== '') {
+        imgId = imgEl.id;
+      } else {
+        imgId = Math.random().toString(36).substring(2, 15);
+        imgEl.id = imgId;
+      }
+      
+      // Skip if already processing or scored
+      if (processingImages[imgId] || scoredImages[imgId]) {
+        return;
+      }
+      
+      // Add to queue
+      queueScore(imgId, imgUrl, 'image');
+    }
+  });
+}
+
+function unloadMutationObserver() {
+  if (typeof(observer) !== 'undefined') {
+    observer.disconnect();
+  }
+}
+
+window.addEventListener('beforeunload', async () => {
+  unloadMutationObserver();
+  console.debug('[LS Filter] cleanup');
+});
+
+function monitorGoogle() {
+  imageScan();
+  keepBlocked();
+
+  if (typeof(observer) !== 'undefined') {
+    observer.disconnect();
+  }
+
+  observer = new MutationObserver(() => {
+    console.debug('[LS Filter] change detected');
+    imageScan();
+
+    // score embeds
+    const m = window.location.href.match(vidMatcher)
+    if (m) {
+      const video = m[1];
+      if (video === prevVideo) {
+        return;
+      }           
+      console.log('[LS Filter] scoring search video ->', video);
+      prevVideo = video;
+      queueScore(video, 'https://www.youtube.com/watch?v=' + video, 'youtube');
+    }
+  })
+  observer.observe(document, {subtree: true, childList: true});
+}
+monitorGoogle();
+
+
+const lsijVersion = 1;
+
+
+
+class Flags {
+	constructor(url, terms) {
+		this.url = url;
+		this.matched = {};
+
+		this.terms = [];
+		terms.forEach((term) => {
+			let s = term.replace(/[\]{}?^$().*\\+|[]/g, '\\$&');
+			s = s.replace(/\\\*/g, '.*');
+			s = s.replace(/\\\?/g, '.');
+			let regex = new RegExp('\\b' + s + '\\b', 'gi');
+
+			this.terms.push({term: term, regex: regex});
+		});
+	}
+
+	report(flags) {
+		if (!flags.length) {
+			return;
+		}
+		console.debug('[LS Filter] sending -> ', flags);
+
+		const xhr = new XMLHttpRequest();
+		xhr.open('POST', document.location.origin + '/927fa87739152ba4c6f307de8f65a602477a41cd407d9ab84f80c8c7484d1fd0/log_flag', true);
+		xhr.send(JSON.stringify({
+			url: this.url.href,
+			flags: flags,
+			at_epoch_ms: Date.now()
+		}));
+	}
+
+	matchTerms(input) {
+		const matches = [];
+		this.terms.forEach((term) => {
+			if (this.matched[term.term]) {
+				return;
+			}
+
+			const hits = input.match(term.regex);
+			if (!hits || !hits.length) {
+				return;
+			}
+
+			this.matched[term.term] = hits.length;
+			matches.push([term.term, hits.length]);
+		});
+
+		return matches;
+	}
+
+	scanIntentValue(value) {
+		const matches = this.matchTerms(value);
+		const changes = [];
+
+		matches.forEach((match) => {
+			match[2] = true; // mark as user entered
+			changes.push(match);
+		});
+
+		if (changes.length) {
+			this.report(changes);
+		}
+	}
+
+	scanIntentValues(values) {
+		values.forEach((value) => {
+			this.scanIntentValue(value);
+		});
+	}
+
+	scanIntentEvent(event) {
+		switch (event.target.tagName.toLowerCase()) {
+		case 'input':
+			let type = event.target.type || 'text';
+			type = type.toLowerCase();
+
+			// Dont scan password fields
+			if (type === 'password') {
+				return;
+			}
+
+			this.scanIntentValue(event.target.value);
+			break;
+
+		case 'textarea':
+			this.scanIntentValue(event.target.value);
+			break;
+
+		}
+	}
+
+	scanIntent() {
+		if (typeof(gatherIntent) === 'function') {
+			const intent = gatherIntent();
+			if (intent.length) {
+				this.scanIntentValues(intent);
+			}
+		}
+	}
+
+	onChange(event) {
+		this.scanIntentEvent(event);
+	}
+
+	onKeyup(event) {
+		this.scanIntentEvent(event);
+	}
+
+	bindDOM() {
+		document.addEventListener('change', this.onChange.bind(this));
+		document.addEventListener('keyup', this.onKeyup.bind(this));
+		setInterval(() => {
+			this.scanIntent();
+		}, 1000);
+	}
+}
+
+function initFlagScanning() {
+	const xhr = new XMLHttpRequest();
+	xhr.open('POST', document.location.origin + '/927fa87739152ba4c6f307de8f65a602477a41cd407d9ab84f80c8c7484d1fd0/get_flags', false);
+	xhr.send(JSON.stringify({}));
+	
+	let terms = [];
+	if (xhr.status === 200) {
+		try {
+			terms = JSON.parse(xhr.responseText);
+		} catch (e) {
+			console.error('[LS Filter] failed to parse flagged terms:', e);
+		}
+	}
+
+	if (!terms.length) {
+		return;
+	}
+
+	console.debug('[LS Filter] init flag scanning');
+	const a = document.createElement('A');
+	a.href = window.location.href;
+	const flags = new Flags(a, terms);
+
+	
+	console.debug('[LS Filter] flagging page scan');
+	
+	let lastContent = '';
+	const scanAndReport = function() {
+		console.debug('[LS Filter] scanAndReport');
+		try {
+			// Make sure we are up to date on our url
+			if (a.href !== window.location.href) {
+				console.debug('[LS Filter] location changed');
+				a.href = window.location.href;
+			}
+
+			let content = '';
+			if (typeof(gatherContent) === 'function') {
+				content = gatherContent();
+			} else if (document.body) {
+				content += document.body.innerText;
+			}
+
+			// Only scan text if changed
+			if (content === lastContent) {
+				return;
+			}
+			lastContent = content;
+
+			// Match
+			const matches = flags.matchTerms(content);
+			if (matches.length) {
+				console.debug('[LS Filter] matched terms: ', matches);
+				flags.report(matches);
+			}
+		} catch (e) {
+			console.error(e);
+		}
+	};
+
+	setInterval(scanAndReport, 5000);
+	scanAndReport();
+	
+};
+
+initFlagScanning();
+
+
+
+const blockImg = "/927fa87739152ba4c6f307de8f65a602477a41cd407d9ab84f80c8c7484d1fd0/blocked-image-search.png";
+
+let hardBlockPolicy;
+
+function scoreUrl(body, callback) {
+  const xhr = new XMLHttpRequest();
+  const checkUrl = document.location.origin + '/927fa87739152ba4c6f307de8f65a602477a41cd407d9ab84f80c8c7484d1fd0/log';
+  xhr.open('POST', checkUrl, true);
+  xhr.send(JSON.stringify(body));
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4) { // Request completed
+      if (this.status === 200 && xhr.responseText) {
+        try {
+          const score = JSON.parse(xhr.responseText);
+          if (callback) {
+            callback(score);
+          } else {
+            console.log('[LS Filter] score ->', score.allow);
+            if (score.redirect) {
+              window.location.href = score.redirect;
+              hardBlock();
+            }
+          }
+        } catch (err) {
+          console.error('[LS Filter] error parsing score response ->', err);
+          if (callback) {
+            callback({ allow: 'error', error: err.message });
+          }
+        }
+      } else {
+        // HTTP error or empty response
+        console.error('[LS Filter] score request failed ->', this.status, xhr.statusText);
+        if (callback) {
+          callback({ allow: 'error', error: `HTTP ${this.status}` });
+        }
+      }
+    }
+  };
+  
+  // Handle network errors
+  xhr.onerror = function() {
+    console.error('[LS Filter] score request network error');
+    if (callback) {
+      callback({ allow: 'error', error: 'network error' });
+    }
+  };
+  
+  // Handle timeout
+  xhr.ontimeout = function() {
+    console.error('[LS Filter] score request timeout');
+    if (callback) {
+      callback({ allow: 'error', error: 'timeout' });
+    }
+  };
+}
+
+function getHardBlockPolicy() {
+  if (typeof(trustedTypes) !== 'undefined' && !hardBlockPolicy) {
+    hardBlockPolicy = trustedTypes.createPolicy('hardBlock', {
+      createHTML: (string) => string
+    });
+  }
+  return hardBlockPolicy;
+}
+
+function hardBlock() {
+  pauseVideo();
+  const stopInt = setInterval(pauseVideo, 500);
+  setTimeout(() => {
+    const policy = getHardBlockPolicy();
+    if (policy) {
+      document.body.innerHTML = policy.createHTML(`<img src="${blockImg}" style="width: 100%; height: 100%">`);
+    } else {
+      document.body.innerHTML = `<img src="${blockImg}" style="width: 100%; height: 100%">`;
+    }
+    clearInterval(stopInt);
+  }, 3000)
+}
+
+function pauseVideo() {
+  const ea = document.getElementsByTagName('video');
+  if (ea.length == 0) { return; }
+  for (i in ea) {
+    if (typeof(ea[i].pause) !== 'function') { continue; }
+    console.debug('[LS Filter] paused ->', ea[i].paused);
+    if (!ea[i].paused) {
+      console.debug('[LS Filter] pause video');
+      ea[i].pause();
+    }
+    const e = ea[i].closest('ytd-channel-video-player-renderer');
+    if (e && e.style.display !== 'none') {
+      console.debug('[LS Filter] hide autoplay container');
+      e.style.display = 'none';
+    }
+  }
+}
+
+function onLoad() {
+  console.log('[LS Filter] loaded');
+  if (window.top === window.self) {
+    console.log('[LS Filter] top window: ' + window.location.href);
+    scoreUrl({ url: window.location.href }, false);
+  }
+}
+
+onLoad();
+
+
+
+</script>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mrs. Smith's English 4 | Segment 1 & 2 Dynamic Pace Chart (FLVS Flex)</title>
+<style>
+  :root {
+    --navy-dark: #1E3A5F;
+    --slate-sub: #2C5282;
+    --sage-bg: #EBF3EE;
+    --sage-accent: #D4E6DC;
+    --input-fill: #FFFDF0;
+    --zebra-fill: #F1F5F9;
+    --white: #FFFFFF;
+    --border-gray: #CBD5E1;
+    --green-done-bg: #DCFCE7;
+    --green-done-txt: #166534;
+    --amber-prog-bg: #FEF3C7;
+    --amber-prog-txt: #92400E;
+    --muted-bg: #F1F5F9;
+    --muted-txt: #94A3B8;
+    --text-dark: #1E293B;
+    --text-muted: #475569;
+    --link-blue: #1D4ED8;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Calibri, Arial, sans-serif;
+    background: #F4F7FA;
+    color: var(--text-dark);
+    line-height: 1.45;
+  }
+
+  .container {
+    max-width: 1380px;
+    margin: 20px auto;
+    background: var(--white);
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(15, 23, 42, 0.08);
+    overflow: hidden;
+    border: 1px solid var(--border-gray);
+  }
+
+  /* Header */
+  .banner-top {
+    background: var(--navy-dark);
+    color: var(--white);
+    text-align: center;
+    padding: 18px 20px 10px;
+  }
+  .banner-top h1 {
+    margin: 0;
+    font-size: 1.45rem;
+    letter-spacing: 0.4px;
+  }
+  .banner-sub {
+    background: var(--slate-sub);
+    color: #E2E8F0;
+    text-align: center;
+    padding: 8px 16px;
+    font-size: 0.9rem;
+    font-style: italic;
+  }
+
+  /* Segment Switcher Bar */
+  .segment-bar {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 20px;
+    background: #F8FAFC;
+    border-bottom: 1px solid var(--border-gray);
+  }
+  .seg-tabs {
+    display: flex;
+    gap: 8px;
+  }
+  .seg-tab {
+    padding: 9px 18px;
+    border-radius: 7px;
+    border: 1.5px solid var(--navy-dark);
+    background: var(--white);
+    color: var(--navy-dark);
+    font-weight: 700;
+    font-size: 0.92rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .seg-tab.active {
+    background: var(--navy-dark);
+    color: var(--white);
+  }
+  .seg-tab:hover:not(.active) {
+    background: #E2E8F0;
+  }
+  .action-btns {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .btn-util {
+    padding: 8px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border-gray);
+    background: var(--white);
+    color: var(--text-dark);
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-util:hover {
+    background: #F1F5F9;
+  }
+
+  /* Setup & Summary Grid */
+  .controls-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 16px 20px;
+  }
+  @media (max-width: 900px) {
+    .controls-grid { grid-template-columns: 1fr; }
+  }
+  .panel {
+    border: 1px solid #94A3B8;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .panel-header {
+    background: var(--sage-accent);
+    color: var(--navy-dark);
+    font-weight: 700;
+    font-size: 0.85rem;
+    padding: 7px 12px;
+    letter-spacing: 0.3px;
+    border-bottom: 1px solid #94A3B8;
+  }
+  .panel-row {
+    display: grid;
+    grid-template-columns: 185px 1fr;
+    border-bottom: 1px solid #CBD5E1;
+    min-height: 36px;
+  }
+  .panel-row:last-child { border-bottom: none; }
+  .panel-label {
+    background: var(--sage-bg);
+    font-weight: 700;
+    font-size: 0.86rem;
+    padding: 7px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    text-align: right;
+    border-right: 1px solid #CBD5E1;
+  }
+  .panel-val {
+    background: var(--white);
+    padding: 5px 10px;
+    display: flex;
+    align-items: center;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  .panel-val.editable {
+    background: var(--input-fill);
+  }
+  .panel-val input, .panel-val select {
+    width: 100%;
+    border: 1px solid #CBD5E1;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--navy-dark);
+    background: var(--input-fill);
+    font-family: inherit;
+  }
+  .panel-val input:focus, .panel-val select:focus {
+    outline: 2px solid var(--slate-sub);
+    border-color: var(--slate-sub);
+  }
+  .clear-date-btn {
+    margin-left: 6px;
+    padding: 4px 8px;
+    font-size: 0.78rem;
+    border-radius: 4px;
+    border: 1px solid #CBD5E1;
+    background: #F8FAFC;
+    cursor: pointer;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .clear-date-btn:hover { background: #E2E8F0; color: var(--text-dark); }
+
+  .error-banner {
+    display: none;
+    margin: 0 20px 12px;
+    padding: 9px 14px;
+    background: #FEE2E2;
+    color: #991B1B;
+    border: 1px solid #FCA5A5;
+    border-radius: 6px;
+    font-size: 0.86rem;
+    font-weight: 600;
+  }
+
+  /* Expectations Box */
+  .expectations {
+    margin: 0 20px 16px;
+    border: 1px solid var(--border-gray);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .expectations-hdr {
+    background: var(--sage-accent);
+    color: var(--navy-dark);
+    font-weight: 700;
+    font-size: 0.84rem;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-gray);
+  }
+  .expectations-body {
+    background: var(--sage-bg);
+    padding: 9px 14px;
+    font-size: 0.84rem;
+  }
+  .expectations-body ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .expectations-body li { margin-bottom: 3px; }
+
+  /* Progress Bar */
+  .progress-wrap {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .progress-track {
+    flex: 1;
+    height: 10px;
+    background: #E2E8F0;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: #16A34A;
+    width: 0%;
+    transition: width 0.25s ease;
+  }
+
+  /* Main Table */
+  .table-wrap {
+    padding: 0 20px 16px;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 1050px;
+    font-size: 0.87rem;
+  }
+  thead th {
+    background: var(--navy-dark);
+    color: var(--white);
+    font-weight: 700;
+    padding: 10px 8px;
+    border: 1px solid var(--border-gray);
+    text-align: center;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  thead th.left { text-align: left; padding-left: 12px; }
+
+  tbody td {
+    border: 1px solid var(--border-gray);
+    padding: 8px 8px;
+    vertical-align: middle;
+  }
+  tbody tr.week-even { background: var(--zebra-fill); }
+  tbody tr.week-odd { background: var(--white); }
+
+  tbody tr.row-done {
+    background: var(--green-done-bg) !important;
+    color: var(--green-done-txt);
+  }
+  tbody tr.row-done td { color: var(--green-done-txt); }
+
+  tbody tr.row-muted {
+    background: var(--muted-bg) !important;
+    color: var(--muted-txt);
+    font-style: italic;
+  }
+  tbody tr.row-muted td { color: var(--muted-txt); }
+
+  td.col-week {
+    text-align: center;
+    font-weight: 700;
+    color: var(--navy-dark);
+    white-space: nowrap;
+    width: 82px;
+  }
+  td.col-mod {
+    text-align: center;
+    font-weight: 700;
+    color: var(--navy-dark);
+    white-space: nowrap;
+    width: 84px;
+  }
+  td.col-date {
+    text-align: center;
+    white-space: nowrap;
+    width: 112px;
+  }
+  td.col-assign {
+    font-weight: 700;
+    padding-left: 12px;
+    width: 230px;
+  }
+  td.col-notes {
+    padding-left: 12px;
+    font-size: 0.83rem;
+  }
+  td.col-links {
+    width: 250px;
+    text-align: center;
+  }
+  .res-link {
+    display: inline-block;
+    margin: 2px 3px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: #EFF6FF;
+    border: 1px solid #BFDBFE;
+    color: var(--link-blue);
+    font-weight: 700;
+    font-size: 0.78rem;
+    text-decoration: none;
+  }
+  .res-link:hover {
+    background: #DBEAFE;
+    text-decoration: underline;
+  }
+  td.col-status {
+    text-align: center;
+    width: 132px;
+  }
+  select.status-select {
+    padding: 5px 7px;
+    border-radius: 5px;
+    border: 1px solid #CBD5E1;
+    font-weight: 700;
+    font-size: 0.82rem;
+    cursor: pointer;
+    width: 118px;
+  }
+  select.status-not-started { background: #F8FAFC; color: var(--text-muted); }
+  select.status-in-progress { background: var(--amber-prog-bg); color: var(--amber-prog-txt); border-color: #FCD34D; }
+  select.status-done { background: var(--green-done-bg); color: var(--green-done-txt); border-color: #86EFAC; }
+
+  .footer-banner {
+    margin: 0 20px 20px;
+    background: var(--sage-accent);
+    color: var(--navy-dark);
+    font-weight: 700;
+    font-style: italic;
+    text-align: center;
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-gray);
+  }
+
+  @media print {
+    body { background: #fff; }
+    .container { box-shadow: none; border: none; margin: 0; max-width: 100%; }
+    .action-btns, .clear-date-btn { display: none !important; }
+    .panel-val input, .panel-val select { border: none; background: transparent; padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div class="banner-top">
+    <h1 id="mainTitle">MRS. SMITH'S ENGLISH 4 | SEGMENT 1 DYNAMIC PACING GUIDE (FLVS FLEX)</h1>
+  </div>
+  <div class="banner-sub">
+    Change Target Weeks or Custom Finish Date — every assignment row automatically updates its matching Week # &amp; dates!
+  </div>
+
+  <!-- Segment Switcher & Actions -->
+  <div class="segment-bar">
+    <div class="seg-tabs">
+      <button class="seg-tab active" id="tabSeg1" onclick="switchSegment(1)">Segment 1 (Modules 1–3)</button>
+      <button class="seg-tab" id="tabSeg2" onclick="switchSegment(2)">Segment 2 (Modules 4–6)</button>
+    </div>
+    <div class="action-btns">
+      <button class="btn-util" onclick="window.print()">Print / Save as PDF</button>
+      <button class="btn-util" onclick="resetCurrentSegment()">Reset Progress</button>
+    </div>
+  </div>
+
+  <!-- Setup & Auto-Calculated Summary -->
+  <div class="controls-grid">
+    <div class="panel">
+      <div class="panel-header">STUDENT SETUP (EDIT YELLOW FIELDS)</div>
+      <div class="panel-row">
+        <div class="panel-label">Student Name:</div>
+        <div class="panel-val editable">
+          <input type="text" id="studentName" value="Sample Student" oninput="saveState()" />
+        </div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Start Date:</div>
+        <div class="panel-val editable">
+          <input type="date" id="startDate" value="2026-12-30" onchange="recalculate()" />
+        </div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Target Weeks (2–16):</div>
+        <div class="panel-val editable">
+          <input type="number" id="targetWeeks" min="2" max="16" value="16" oninput="recalculate()" />
+        </div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Custom Finish Date:</div>
+        <div class="panel-val editable">
+          <input type="date" id="customFinishDate" onchange="recalculate()" />
+          <button class="clear-date-btn" onclick="clearCustomFinish()" title="Clear custom date to use Target Weeks">Clear</button>
+        </div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Course Track:</div>
+        <div class="panel-val editable">
+          <select id="courseTrack" onchange="recalculate()">
+            <option value="Honors" selected>Honors (Includes 3 Honors Tasks)</option>
+            <option value="Standard">Standard</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">AUTO-CALCULATED SCHEDULE SUMMARY &amp; LIVE PROGRESS</div>
+      <div class="panel-row">
+        <div class="panel-label">Active Pacing Weeks:</div>
+        <div class="panel-val" id="summaryWeeks">16 Weeks</div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Target Finish Date:</div>
+        <div class="panel-val" id="summaryFinishDate">—</div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Week Format:</div>
+        <div class="panel-val editable">
+          <select id="weekFormat" onchange="recalculate()">
+            <option value="rolling" selected>Rolling 7-Day Weeks</option>
+            <option value="school">Monday–Friday School Weeks</option>
+          </select>
+        </div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">Assignments Completed:</div>
+        <div class="panel-val">
+          <div class="progress-wrap">
+            <span id="summaryProgressText" style="white-space:nowrap;">0 of 20 (0%)</span>
+            <div class="progress-track"><div class="progress-fill" id="progressBar"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel-row">
+        <div class="panel-label">How Week # Works:</div>
+        <div class="panel-val" style="font-weight:400; font-size:0.82rem; color:var(--text-muted);">
+          Every assignment keeps its own row — when set to 8 or 5 weeks, rows due the same week share the same Week # &amp; dates!
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="error-banner" id="dateErrorBanner">
+    Note: Finish Date must be at least 14 days after your Start Date (FLVS minimum segment seat-time rule). Adjusted automatically to valid range.
+  </div>
+
+  <!-- Reminders -->
+  <div class="expectations">
+    <div class="expectations-hdr">COURSE EXPECTATIONS &amp; REMINDERS</div>
+    <div class="expectations-body">
+      <ul>
+        <li><strong>Weekly Submissions:</strong> Required every week to remain active in English 4. You may work ahead of pace, but cannot complete a segment in under 14 days.</li>
+        <li><strong>Note-Taking Guides:</strong> Not for a grade, but allowed on all quizzes, assignments, DBAs, and the Segment Exam. Click any blue button in the Resources column to open your guide or Help Slide.</li>
+        <li id="honorsReminder"><strong>Honors English 4:</strong> Requires 3 additional assignments in Segment 1 (H1.06, H2.06, H3.07) — automatically included when Honors is selected.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Pacing Table -->
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Week #</th>
+          <th>Module</th>
+          <th>Week Start</th>
+          <th>Week End</th>
+          <th class="left">Assignment</th>
+          <th class="left">Instructions &amp; Submission Notes</th>
+          <th>Resource Links</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="paceTableBody"></tbody>
+    </table>
+  </div>
+
+  <div class="footer-banner">
+    Stay on Track! Plan Ahead! Achieve Success!
+  </div>
+</div>
+
+<script>
+const URL_DBA_HOURS = "https://canva.link/cifkmj159yv1m6u";
+
+const SEGMENTS = {
+  1: {
+    title: "MRS. SMITH'S ENGLISH 4 | SEGMENT 1 DYNAMIC PACING GUIDE (FLVS FLEX)",
+    honorsNote: "<strong>Honors English 4:</strong> Requires 3 additional assignments in Segment 1 (H1.06, H2.06, H3.07) — automatically included when Honors is selected.",
+    items: [
+      { id: "s1_1", blk: 1, honors: false, mod: "Mod 1", assign: "Quiz 1.01 Structurally Sound",
+        notes: "Review Lesson in Educator; take notes using Mod 1 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 1 Note-Taking Guide", url: "https://docs.google.com/presentation/d/10hp9pbexGNjXjva0EBIeiB71YfhIKd9rrVZnwdGttvE/edit?usp=sharing" }] },
+      { id: "s1_2", blk: 2, honors: false, mod: "Mod 1", assign: "Quiz 1.02 Get My Point",
+        notes: "Review Lesson in Educator; take notes using Mod 1 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 1 Note-Taking Guide", url: "https://docs.google.com/presentation/d/10hp9pbexGNjXjva0EBIeiB71YfhIKd9rrVZnwdGttvE/edit?usp=sharing" }] },
+      { id: "s1_3", blk: 3, honors: false, mod: "Mod 1", assign: "1.03 Purposeful Writing",
+        notes: "Review Lesson in Educator; take notes using Mod 1 Note-Taking Guide. Submit 1.03 Purposeful Writing Help Slide (graphic organizer & rubric).",
+        links: [
+          { label: "Mod 1 Note-Taking Guide", url: "https://docs.google.com/presentation/d/10hp9pbexGNjXjva0EBIeiB71YfhIKd9rrVZnwdGttvE/edit?usp=sharing" },
+          { label: "1.03 Help Slide", url: "https://canva.link/s0ty3o7s8unnyj9" }
+        ] },
+      { id: "s1_4", blk: 4, honors: false, mod: "Mod 1", assign: "1.04 Effective Presentations",
+        notes: "Review Lesson in Educator; take notes using Mod 1 Note-Taking Guide. Submit 1.04 Effective Presentations Help Slide (PowerPoint/Google Slides).",
+        links: [
+          { label: "Mod 1 Note-Taking Guide", url: "https://docs.google.com/presentation/d/10hp9pbexGNjXjva0EBIeiB71YfhIKd9rrVZnwdGttvE/edit?usp=sharing" },
+          { label: "1.04 Help Slide", url: "https://canva.link/scgxdx4lwu03t77" }
+        ] },
+      { id: "s1_5", blk: 5, honors: false, mod: "Mod 1", assign: "1.05 Back to Basics DBA",
+        notes: "Attend 1.05 DBA Office Hours to complete your Module 1 Discussion-Based Assessment.",
+        links: [{ label: "1.05 DBA Office Hours", url: URL_DBA_HOURS }] },
+      { id: "s1_6", blk: 5, honors: true, mod: "Mod 1 (H)", assign: "H1.06 Honors Assignment",
+        notes: "Honors Only: Submit H1.06 Help Slide (graphic organizer and rubric).",
+        links: [{ label: "H1.06 Help Slide", url: "https://canva.link/mv5q9ql4x3lkyng" }] },
+      { id: "s1_7", blk: 5, honors: false, mod: "Mod 1", assign: "1.07 Mod 1 Exam",
+        notes: "Review Mod 1 Note-Taking Guide and complete the Module 1 Exam in Educator.",
+        links: [{ label: "Mod 1 Note-Taking Guide", url: "https://docs.google.com/presentation/d/10hp9pbexGNjXjva0EBIeiB71YfhIKd9rrVZnwdGttvE/edit?usp=sharing" }] },
+      { id: "s1_8", blk: 6, honors: false, mod: "Mod 2", assign: "2.01 Literature 101",
+        notes: "Review Lesson & Mod 2 Note-Taking Guide. Submit 2.01 Help Slide (graphic organizer & rubric); select novel from Novel List & follow Novel Pacing Guide.",
+        links: [
+          { label: "Mod 2 Note-Taking Guide", url: "https://docs.google.com/presentation/d/13LbMCq3m0-hyOUvO9-XkbzpcqvGlpeGd5XO5ya1jPWg/edit?usp=sharing" },
+          { label: "2.01 Help Slide", url: "https://canva.link/p5n95g4930tmrig" },
+          { label: "Novel List", url: "https://canva.link/oqrxti12cgvr1if" },
+          { label: "Novel Pacing Guide", url: "https://canva.link/j5w1dbhxsz02x5n" }
+        ] },
+      { id: "s1_9", blk: 7, honors: false, mod: "Mod 2", assign: "Quiz 2.02",
+        notes: "Review Lesson in Educator; take notes using Mod 2 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [
+          { label: "Mod 2 Note-Taking Guide", url: "https://docs.google.com/presentation/d/13LbMCq3m0-hyOUvO9-XkbzpcqvGlpeGd5XO5ya1jPWg/edit?usp=sharing" },
+          { label: "Novel Pacing Guide", url: "https://canva.link/j5w1dbhxsz02x5n" }
+        ] },
+      { id: "s1_10", blk: 8, honors: false, mod: "Mod 2", assign: "Quiz 2.03",
+        notes: "Review Lesson in Educator; take notes using Mod 2 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [
+          { label: "Mod 2 Note-Taking Guide", url: "https://docs.google.com/presentation/d/13LbMCq3m0-hyOUvO9-XkbzpcqvGlpeGd5XO5ya1jPWg/edit?usp=sharing" },
+          { label: "Novel Pacing Guide", url: "https://canva.link/j5w1dbhxsz02x5n" }
+        ] },
+      { id: "s1_11", blk: 9, honors: false, mod: "Mod 2", assign: "Quiz 2.04",
+        notes: "Review Lesson in Educator; take notes using Mod 2 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [
+          { label: "Mod 2 Note-Taking Guide", url: "https://docs.google.com/presentation/d/13LbMCq3m0-hyOUvO9-XkbzpcqvGlpeGd5XO5ya1jPWg/edit?usp=sharing" },
+          { label: "Novel Pacing Guide", url: "https://canva.link/j5w1dbhxsz02x5n" }
+        ] },
+      { id: "s1_12", blk: 10, honors: false, mod: "Mod 2", assign: "2.05 Rules for Review",
+        notes: "Review Lesson in Educator; take notes using Mod 2 Note-Taking Guide. Submit 2.05 Help Slide (complete on a blank Word/Google Doc).",
+        links: [
+          { label: "Mod 2 Note-Taking Guide", url: "https://docs.google.com/presentation/d/13LbMCq3m0-hyOUvO9-XkbzpcqvGlpeGd5XO5ya1jPWg/edit?usp=sharing" },
+          { label: "2.05 Help Slide", url: "https://canva.link/tzoevc8co1ju03h" }
+        ] },
+      { id: "s1_13", blk: 10, honors: true, mod: "Mod 2 (H)", assign: "H2.06 Honors Assignment",
+        notes: "Honors Only: Submit H2.06 Help Slide (graphic organizer and rubric).",
+        links: [{ label: "H2.06 Help Slide", url: "https://canva.link/u0a520x7562n22b" }] },
+      { id: "s1_14", blk: 11, honors: false, mod: "Mod 3", assign: "3.01 Planning Out a Narrative",
+        notes: "Submit 3.01 Planning Out a Narrative Help Slide (graphic organizer and rubric).",
+        links: [{ label: "3.01 Help Slide", url: "https://canva.link/waqcte1nputg7rq" }] },
+      { id: "s1_15", blk: 12, honors: false, mod: "Mod 3", assign: "Quiz 3.02",
+        notes: "Review Lesson in Educator; take notes using Mod 3 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 3 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1gAmnK4TaPfyVgAZ7AMfwMuNYT2ZOCA3DgPAFxa3ijsY/edit?usp=sharing" }] },
+      { id: "s1_16", blk: 13, honors: false, mod: "Mod 3", assign: "3.03 Tell a Tall Tale DBA",
+        notes: "Attend 3.03 DBA Open Office Hours to complete your Module 3 Discussion-Based Assessment.",
+        links: [{ label: "3.03 DBA Office Hours", url: URL_DBA_HOURS }] },
+      { id: "s1_17", blk: 14, honors: false, mod: "Mod 3", assign: "3.05 Put Your Best Foot Forward",
+        notes: "Review Lesson in Educator; take notes using Mod 3 Note-Taking Guide. Submit 3.05 Help Slide (graphic organizer and rubric).",
+        links: [
+          { label: "Mod 3 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1gAmnK4TaPfyVgAZ7AMfwMuNYT2ZOCA3DgPAFxa3ijsY/edit?usp=sharing" },
+          { label: "3.05 Help Slide", url: "https://canva.link/8aa72dwutwf351h" }
+        ] },
+      { id: "s1_18", blk: 15, honors: false, mod: "Mod 3", assign: "3.06 Presenting Literature",
+        notes: "Review Lesson in Educator; take notes using Mod 3 Note-Taking Guide. Submit 3.06 Help Slide (graphic organizer and rubric).",
+        links: [
+          { label: "Mod 3 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1gAmnK4TaPfyVgAZ7AMfwMuNYT2ZOCA3DgPAFxa3ijsY/edit?usp=sharing" },
+          { label: "3.06 Help Slide", url: "https://canva.link/6ma3jani99bh5lw" }
+        ] },
+      { id: "s1_19", blk: 15, honors: true, mod: "Mod 3 (H)", assign: "H3.07 Character Analysis",
+        notes: "Honors Only: Submit H3.07 Character Analysis (graphic organizer and rubric).",
+        links: [{ label: "H3.07 Help Slide", url: "https://canva.link/e88rh2gdihmao7h" }] },
+      { id: "s1_20", blk: 16, honors: false, mod: "Exam", assign: "Segment 1 Exam",
+        notes: "Review Segment 1 Exam Review Guide and complete Segment 1 Exam. (Segment 1 Collaboration is credit for attending one live lesson; exempted if not attended.)",
+        links: [{ label: "Segment 1 Exam Review Guide", url: "https://docs.google.com/document/d/1g5AKbPfADup420535pzn0u7qS4oVmOgFyOitcqTHAY/edit?tab=t.0" }] }
+    ]
+  },
+  2: {
+    title: "MRS. SMITH'S ENGLISH 4 | SEGMENT 2 DYNAMIC PACING GUIDE (FLVS FLEX)",
+    honorsNote: "<strong>Honors English 4:</strong> Requires 3 additional assignments in Segment 2 (H4.07, H5.06, H6.05) — automatically included when Honors is selected.",
+    items: [
+      { id: "s2_1", blk: 1, honors: false, mod: "Mod 4", assign: "Quiz 4.01 Poetry 101",
+        notes: "Review Lesson in Educator; take notes using Mod 4 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 4 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1eKOTOhuhmspvvyoRLCjoP2rSKCwWi89Qq2Pl57Soiss/copy" }] },
+      { id: "s2_2", blk: 2, honors: false, mod: "Mod 4", assign: "Quiz 4.02 Colonial and Early National Poetry",
+        notes: "Review Lesson in Educator; take notes using Mod 4 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 4 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1eKOTOhuhmspvvyoRLCjoP2rSKCwWi89Qq2Pl57Soiss/copy" }] },
+      { id: "s2_3", blk: 3, honors: false, mod: "Mod 4", assign: "Quiz 4.03 Romantic Poetry",
+        notes: "Review Lesson in Educator; take notes using Mod 4 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 4 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1eKOTOhuhmspvvyoRLCjoP2rSKCwWi89Qq2Pl57Soiss/copy" }] },
+      { id: "s2_4", blk: 4, honors: false, mod: "Mod 4", assign: "Quiz 4.04 Modernist Poetry",
+        notes: "Review Lesson in Educator; take notes using Mod 4 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 4 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1eKOTOhuhmspvvyoRLCjoP2rSKCwWi89Qq2Pl57Soiss/copy" }] },
+      { id: "s2_5", blk: 5, honors: false, mod: "Mod 4", assign: "Assignment 4.05 Contemporary Poetry",
+        notes: "Review Lesson in Educator; take notes using Mod 4 Note-Taking Guide. Submit 4.05 Contemporary Poetry Help Slide (graphic organizer and rubric).",
+        links: [
+          { label: "Mod 4 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1eKOTOhuhmspvvyoRLCjoP2rSKCwWi89Qq2Pl57Soiss/copy" },
+          { label: "4.05 Help Slide", url: "https://canva.link/2ghpsq7zd1eo28c" }
+        ] },
+      { id: "s2_6", blk: 6, honors: false, mod: "Mod 4", assign: "4.06 Poetry in Motion DBA",
+        notes: "Attend 4.06 DBA Office Hours to complete your Module 4 Discussion-Based Assessment.",
+        links: [{ label: "4.06 DBA Office Hours", url: URL_DBA_HOURS }] },
+      { id: "s2_7", blk: 6, honors: true, mod: "Mod 4 (H)", assign: "H4.07 Honors Assignment",
+        notes: "Honors Only: Submit H4.07 Help Slide (graphic organizer and rubric).",
+        links: [{ label: "H4.07 Help Slide", url: "https://canva.link/g4nhxp8u3yu5csk" }] },
+      { id: "s2_8", blk: 6, honors: false, mod: "Mod 4", assign: "4.08 Mod 4 Exam",
+        notes: "Review Mod 4 Note-Taking Guide and complete the Module 4 Exam in Educator.",
+        links: [{ label: "Mod 4 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1eKOTOhuhmspvvyoRLCjoP2rSKCwWi89Qq2Pl57Soiss/copy" }] },
+      { id: "s2_9", blk: 7, honors: false, mod: "Mod 5", assign: "Quiz 5.01 Rooted in Facts",
+        notes: "Review Lesson in Educator; take notes using Mod 5 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 5 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1BihTleV9U0h3Dqq24lHFxJEl5ELnmyy_aNzeyQG9UbE/copy" }] },
+      { id: "s2_10", blk: 8, honors: false, mod: "Mod 5", assign: "Assignment 5.02 Set Up for Success",
+        notes: "Review Lesson in Educator; take notes using Mod 5 Note-Taking Guide. Submit 5.02 Set Up for Success Help Slide (graphic organizer and rubric).",
+        links: [
+          { label: "Mod 5 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1BihTleV9U0h3Dqq24lHFxJEl5ELnmyy_aNzeyQG9UbE/copy" },
+          { label: "5.02 Help Slide", url: "https://canva.link/a7dn71kokls9opp" }
+        ] },
+      { id: "s2_11", blk: 9, honors: false, mod: "Mod 5", assign: "Quiz 5.03 Your Words Matter",
+        notes: "Review Lesson in Educator; take notes using Mod 5 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 5 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1BihTleV9U0h3Dqq24lHFxJEl5ELnmyy_aNzeyQG9UbE/copy" }] },
+      { id: "s2_12", blk: 10, honors: false, mod: "Mod 5", assign: "5.04 Perfecting and Publishing",
+        notes: "Review Lesson in Educator; take notes using Mod 5 Note-Taking Guide. Submit 5.04 Perfecting and Publishing (graphic organizer and rubric).",
+        links: [
+          { label: "Mod 5 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1BihTleV9U0h3Dqq24lHFxJEl5ELnmyy_aNzeyQG9UbE/copy" },
+          { label: "5.04 Help Slide", url: "https://canva.link/iudde313zc7cbvn" }
+        ] },
+      { id: "s2_13", blk: 11, honors: false, mod: "Mod 5", assign: "Quiz 5.05 Parts of the Whole",
+        notes: "Review Lesson in Educator; take notes using Mod 5 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 5 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1BihTleV9U0h3Dqq24lHFxJEl5ELnmyy_aNzeyQG9UbE/copy" }] },
+      { id: "s2_14", blk: 11, honors: true, mod: "Mod 5 (H)", assign: "H5.06 Honors Assignment",
+        notes: "Honors Only: Submit H5.06 Help Slide (graphic organizer and rubric).",
+        links: [{ label: "H5.06 Help Slide", url: "https://canva.link/jz8rnyvlgp3re8t" }] },
+      { id: "s2_15", blk: 12, honors: false, mod: "Mod 6", assign: "Quiz 6.01",
+        notes: "Review Lesson in Educator; take notes using Mod 6 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 6 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1JBUf84UonYqX9dgfVEKSX9ZLIaZi2mSyDC4nH6QZNHQ/copy" }] },
+      { id: "s2_16", blk: 13, honors: false, mod: "Mod 6", assign: "Quiz 6.02",
+        notes: "Review Lesson in Educator; take notes using Mod 6 Note-Taking Guide; complete matching/multiple-choice quiz.",
+        links: [{ label: "Mod 6 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1JBUf84UonYqX9dgfVEKSX9ZLIaZi2mSyDC4nH6QZNHQ/copy" }] },
+      { id: "s2_17", blk: 14, honors: false, mod: "Mod 6", assign: "6.03 Passionate Persuasion DBA",
+        notes: "Attend 6.03 DBA Office Hours to complete your Module 6 Discussion-Based Assessment.",
+        links: [{ label: "6.03 DBA Office Hours", url: URL_DBA_HOURS }] },
+      { id: "s2_18", blk: 15, honors: false, mod: "Mod 6", assign: "6.04 Conflicting Perspectives",
+        notes: "Review Lesson in Educator; take notes using Mod 6 Note-Taking Guide. Submit 6.04 Conflicting Perspectives Help Slide (graphic organizer and rubric).",
+        links: [
+          { label: "Mod 6 Note-Taking Guide", url: "https://docs.google.com/presentation/d/1JBUf84UonYqX9dgfVEKSX9ZLIaZi2mSyDC4nH6QZNHQ/copy" },
+          { label: "6.04 Help Slide", url: "https://canva.link/enafn922ubcallf" }
+        ] },
+      { id: "s2_19", blk: 15, honors: true, mod: "Mod 6 (H)", assign: "H6.05 Honors Assignment",
+        notes: "Honors Only: Submit H6.05 Help Slide (graphic organizer and rubric).",
+        links: [{ label: "H6.05 Help Slide", url: "https://canva.link/o06ue4di2pi68jk" }] },
+      { id: "s2_20", blk: 16, honors: false, mod: "Exam", assign: "Segment 2 Exam",
+        notes: "Review Segment 2 Exam Review Guide and complete Segment 2 Exam. (Segment 2 Collaboration is credit for attending one live lesson; exempted if not attended.)",
+        links: [{ label: "Segment 2 Exam Review Guide", url: "https://docs.google.com/document/d/1xdUusJPeUCxsTtuhoTFDUNNVAik2DsJdvgGZumk5wEY/edit?tab=t.0" }] }
+    ]
+  }
+};
+
+let currentSeg = 1;
+let state = {
+  1: { studentName: "Sample Student", startDate: "2026-12-30", targetWeeks: 16, customFinishDate: "", courseTrack: "Honors", weekFormat: "rolling", statuses: {} },
+  2: { studentName: "Sample Student", startDate: "2027-05-01", targetWeeks: 16, customFinishDate: "", courseTrack: "Honors", weekFormat: "rolling", statuses: {} }
+};
+
+function loadSavedState() {
+  try {
+    const raw = localStorage.getItem("eng4_pace_chart_v1");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed[1]) state[1] = { ...state[1], ...parsed[1] };
+      if (parsed[2]) state[2] = { ...state[2], ...parsed[2] };
+    }
+  } catch (e) {}
+}
+
+function saveState() {
+  const s = state[currentSeg];
+  s.studentName = document.getElementById("studentName").value;
+  s.startDate = document.getElementById("startDate").value;
+  s.targetWeeks = parseInt(document.getElementById("targetWeeks").value, 10) || 16;
+  s.customFinishDate = document.getElementById("customFinishDate").value;
+  s.courseTrack = document.getElementById("courseTrack").value;
+  s.weekFormat = document.getElementById("weekFormat").value;
+  try {
+    localStorage.setItem("eng4_pace_chart_v1", JSON.stringify(state));
+  } catch (e) {}
+}
+
+function parseLocalDate(isoStr) {
+  if (!isoStr) return null;
+  const [y, m, d] = isoStr.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function addDays(dateObj, days) {
+  const copy = new Date(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate());
+  copy.setDate(copy.getDate() + days);
+  return copy;
+}
+
+function formatShortDate(dateObj) {
+  if (!dateObj || isNaN(dateObj)) return "—";
+  return dateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatLongDate(dateObj) {
+  if (!dateObj || isNaN(dateObj)) return "—";
+  return dateObj.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+}
+
+function switchSegment(segNum) {
+  saveState();
+  currentSeg = segNum;
+  document.getElementById("tabSeg1").classList.toggle("active", segNum === 1);
+  document.getElementById("tabSeg2").classList.toggle("active", segNum === 2);
+
+  const s = state[currentSeg];
+  document.getElementById("mainTitle").textContent = SEGMENTS[currentSeg].title;
+  document.getElementById("honorsReminder").innerHTML = SEGMENTS[currentSeg].honorsNote;
+  document.getElementById("studentName").value = s.studentName;
+  document.getElementById("startDate").value = s.startDate;
+  document.getElementById("targetWeeks").value = s.targetWeeks;
+  document.getElementById("customFinishDate").value = s.customFinishDate;
+  document.getElementById("courseTrack").value = s.courseTrack;
+  document.getElementById("weekFormat").value = s.weekFormat;
+
+  recalculate();
+}
+
+function clearCustomFinish() {
+  document.getElementById("customFinishDate").value = "";
+  recalculate();
+}
+
+function resetCurrentSegment() {
+  if (!confirm("Reset all assignment statuses for Segment " + currentSeg + " to 'Not Started'?")) return;
+  state[currentSeg].statuses = {};
+  recalculate();
+}
+
+function updateItemStatus(itemId, newVal) {
+  state[currentSeg].statuses[itemId] = newVal;
+  saveState();
+  recalculate();
+}
+
+function recalculate() {
+  const startInput = document.getElementById("startDate").value;
+  let startD = parseLocalDate(startInput) || new Date(2026, 11, 30);
+
+  let targetW = parseInt(document.getElementById("targetWeeks").value, 10);
+  if (isNaN(targetW) || targetW < 2) targetW = 2;
+  if (targetW > 16) targetW = 16;
+
+  const customFinishInput = document.getElementById("customFinishDate").value;
+  let customD = parseLocalDate(customFinishInput);
+  const errBanner = document.getElementById("dateErrorBanner");
+  errBanner.style.display = "none";
+
+  let activeWeeks = targetW;
+  let usingCustom = false;
+
+  if (customD) {
+    const diffDays = Math.round((customD - startD) / (1000 * 60 * 60 * 24)) + 1;
+    if (diffDays < 14) {
+      errBanner.style.display = "block";
+      customD = addDays(startD, 13);
+      activeWeeks = 2;
+    } else {
+      activeWeeks = Math.max(2, Math.min(16, Math.round(diffDays / 7)));
+    }
+    usingCustom = true;
+  }
+
+  const track = document.getElementById("courseTrack").value;
+  const format = document.getElementById("weekFormat").value;
+
+  // Base start date S0 for standard rolling vs Mon-Fri school week
+  let baseS0 = startD;
+  if (!usingCustom && format === "school") {
+    const day = startD.getDay(); // 0=Sun, 1=Mon..6=Sat
+    const diffToMon = (day === 0 ? -6 : 1 - day);
+    baseS0 = addDays(startD, diffToMon);
+  }
+
+  function getWeekDates(w) {
+    if (!usingCustom) {
+      const ws = addDays(baseS0, (w - 1) * 7);
+      const we = addDays(ws, format === "rolling" ? 6 : 4);
+      return { start: ws, end: we };
+    } else {
+      const totalSpan = Math.round((customD - startD) / (1000 * 60 * 60 * 24)) + 1;
+      const ws = addDays(startD, Math.round(((w - 1) / activeWeeks) * totalSpan));
+      let we;
+      if (w === activeWeeks) {
+        we = customD;
+      } else {
+        const candidateEnd = addDays(startD, Math.round((w / activeWeeks) * totalSpan) - 1);
+        we = candidateEnd < ws ? ws : candidateEnd;
+      }
+      return { start: ws, end: we };
+    }
+  }
+
+  const segItems = SEGMENTS[currentSeg].items;
+  const tbody = document.getElementById("paceTableBody");
+  tbody.innerHTML = "";
+
+  let totalRequired = 0;
+  let totalDone = 0;
+  let finalEndDate = null;
+
+  segItems.forEach((item) => {
+    const isSkipped = item.honors && track === "Standard";
+    const w = Math.ceil((item.blk * activeWeeks) / 16);
+    const dates = getWeekDates(w);
+    if (!isSkipped) finalEndDate = dates.end;
+
+    const status = state[currentSeg].statuses[item.id] || "Not Started";
+    if (!isSkipped) {
+      totalRequired++;
+      if (status === "Done") totalDone++;
+    }
+
+    const tr = document.createElement("tr");
+    if (isSkipped) {
+      tr.className = "row-muted";
+    } else if (status === "Done") {
+      tr.className = "row-done";
+    } else {
+      tr.className = (w % 2 === 0) ? "week-even" : "week-odd";
+    }
+
+    const linksHtml = item.links.map(l =>
+      `<a class="res-link" href="${l.url}" target="_blank" rel="noopener noreferrer">${l.label}</a>`
+    ).join(" ");
+
+    const statusClass = status === "Done" ? "status-done" : (status === "In Progress" ? "status-in-progress" : "status-not-started");
+
+    tr.innerHTML = `
+      <td class="col-week">${isSkipped ? "—" : "Week " + w}</td>
+      <td class="col-mod">${item.mod}</td>
+      <td class="col-date">${isSkipped ? "" : formatShortDate(dates.start)}</td>
+      <td class="col-date">${isSkipped ? "" : formatShortDate(dates.end)}</td>
+      <td class="col-assign">${isSkipped ? item.assign + " (Skipped - Standard Track)" : item.assign}</td>
+      <td class="col-notes">${item.notes}</td>
+      <td class="col-links">${linksHtml}</td>
+      <td class="col-status">
+        <select class="status-select ${statusClass}" onchange="updateItemStatus('${item.id}', this.value)">
+          <option value="Not Started" ${status === "Not Started" ? "selected" : ""}>Not Started</option>
+          <option value="In Progress" ${status === "In Progress" ? "selected" : ""}>In Progress</option>
+          <option value="Done" ${status === "Done" ? "selected" : ""}>Done</option>
+        </select>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById("summaryWeeks").textContent = activeWeeks + " Weeks";
+  document.getElementById("summaryFinishDate").textContent = formatLongDate(usingCustom ? customD : finalEndDate);
+
+  const pct = totalRequired > 0 ? Math.round((totalDone / totalRequired) * 100) : 0;
+  document.getElementById("summaryProgressText").textContent = `${totalDone} of ${totalRequired} (${pct}%)`;
+  document.getElementById("progressBar").style.width = pct + "%";
+
+  saveState();
+}
+
+loadSavedState();
+switchSegment(1);
+</script>
+</body>
+</html>
